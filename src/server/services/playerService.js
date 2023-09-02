@@ -19,7 +19,7 @@ class PlayerService {
     connect(socket) {
         const player = new Player(socket.id);
 
-        socket.on('gotit', (data) => this.spawnPlayer(player, socket, data)) //TODO: move to controller, add chat service/controller & commands service
+        socket.on('gotit', (data) => this.onPlayerConnected(player, socket, data)) //TODO: move to controller, add chat service/controller & commands service
             .on('pingcheck', () => socket.emit('pongcheck'))
             .on('windowResized', (data) => this.updatePlayerWindow(player, data))
             .on('respawn', () => this.respawnPlayer(player, socket))
@@ -183,7 +183,7 @@ class PlayerService {
         )
     }
 
-    spawnPlayer(player, socket, data) {
+    onPlayerConnected(player, socket, data) {
         console.log('[INFO] Player ' + data.name + ' connecting!');
 
         if (this.map.players.findIndexByID(socket.id) > -1) {
@@ -197,12 +197,13 @@ class PlayerService {
         }
 
         player.init(this.getSpawnPoint(), config.defaultPlayerMass);
-
-        console.log('[INFO] Player ' + data.name + ' connected!');
-        this.netService.connectClient(socket.id, socket);
         player.clientProvidedData(data);
+
+        this.netService.connectClient(socket.id, socket);
         this.map.players.pushNew(player);
         this.netService.sendToAll('playerJoin', { name: player.name });
+
+        console.log('[INFO] Player ' + data.name + ' connected!');
         console.log('Total players: ' + this.map.players.data.length);
     }
 
