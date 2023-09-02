@@ -105,6 +105,13 @@ exports.Player = class {
         };
     }
 
+    updateTarget(target) {
+        this.setLastHeartbeat()
+        if (target.x !== this.x || target.y !== this.y) {
+            this.target = target;
+        }
+    }
+
     clientProvidedData(playerData) {
         this.name = playerData.name;
         this.screenWidth = playerData.screenWidth;

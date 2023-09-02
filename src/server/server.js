@@ -1,40 +1,27 @@
 /*jslint bitwise: true, node: true */
 'use strict';
 
-const express = require('express');
-const app = express();
-const http = require('http').Server(app);
-const io = require('socket.io')(http);
-const SAT = require('sat');
-
-const gameLogic = require('./game-logic');
-const loggingRepositry = require('./repositories/logging-repository');
-const chatRepository = require('./repositories/chat-repository');
 const config = require('../../config');
-const util = require('./lib/util');
 const mapUtils = require('./map/map');
-const {getPosition} = require("./lib/entityUtils");
 
 let map = new mapUtils.Map(config);
 
-let sockets = {};
+const NetService = require('./services/netService')
+const PlayerService = require('./services/playerService')
+const netService = new NetService()
+const playerService = new PlayerService(netService, map)
+
 let spectators = [];
-const INIT_MASS_LOG = util.mathLog(config.defaultPlayerMass, config.slowBase);
 
 let leaderboard = [];
 let leaderboardChanged = false;
 
-const Vector = SAT.Vector;
-const Circle = SAT.Circle;
-
-app.use(express.static(__dirname + '/../client'));
-
-io.on('connection', function (socket) {
+netService.on('connection', (socket) => {
     let type = socket.handshake.query.type;
     console.log('User has connected: ', type);
     switch (type) {
         case 'player':
-            addPlayer(socket);
+            playerService.connect(socket);
             break;
         case 'spectator':
             addSpectator(socket);
@@ -44,162 +31,11 @@ io.on('connection', function (socket) {
     }
 });
 
-function generateSpawnpoint() {
-    let radius = util.massToRadius(config.defaultPlayerMass);
-    return getPosition(config.newPlayerInitialPosition === 'farthest', radius, map.players.data)
-}
-
-
-const addPlayer = (socket) => {
-    var currentPlayer = new mapUtils.playerUtils.Player(socket.id);
-
-    socket.on('gotit', function (clientPlayerData) {
-        console.log('[INFO] Player ' + clientPlayerData.name + ' connecting!');
-        currentPlayer.init(generateSpawnpoint(), config.defaultPlayerMass);
-
-        if (map.players.findIndexByID(socket.id) > -1) {
-            console.log('[INFO] Player ID is already connected, kicking.');
-            socket.disconnect();
-        } else if (!util.validNick(clientPlayerData.name)) {
-            socket.emit('kick', 'Invalid username.');
-            socket.disconnect();
-        } else {
-            console.log('[INFO] Player ' + clientPlayerData.name + ' connected!');
-            sockets[socket.id] = socket;
-            currentPlayer.clientProvidedData(clientPlayerData);
-            map.players.pushNew(currentPlayer);
-            io.emit('playerJoin', { name: currentPlayer.name });
-            console.log('Total players: ' + map.players.data.length);
-        }
-
-    });
-
-    socket.on('pingcheck', () => {
-        socket.emit('pongcheck');
-    });
-
-    socket.on('windowResized', (data) => {
-        currentPlayer.screenWidth = data.screenWidth;
-        currentPlayer.screenHeight = data.screenHeight;
-    });
-
-    socket.on('respawn', () => {
-        map.players.removePlayerByID(currentPlayer.id);
-        socket.emit('welcome', currentPlayer, {
-            width: config.gameWidth,
-            height: config.gameHeight
-        });
-        console.log('[INFO] User ' + currentPlayer.name + ' has respawned');
-    });
-
-    socket.on('disconnect', () => {
-        map.players.removePlayerByID(currentPlayer.id);
-        console.log('[INFO] User ' + currentPlayer.name + ' has disconnected');
-        socket.broadcast.emit('playerDisconnect', { name: currentPlayer.name });
-    });
-
-    socket.on('playerChat', (data) => {
-        var _sender = data.sender.replace(/(<([^>]+)>)/ig, '');
-        var _message = data.message.replace(/(<([^>]+)>)/ig, '');
-
-        if (config.logChat === 1) {
-            console.log('[CHAT] [' + (new Date()).getHours() + ':' + (new Date()).getMinutes() + '] ' + _sender + ': ' + _message);
-        }
-
-        socket.broadcast.emit('serverSendPlayerChat', {
-            sender: _sender,
-            message: _message.substring(0, 35)
-        });
-
-        chatRepository.logChatMessage(_sender, _message, currentPlayer.ipAddress)
-            .catch((err) => console.error("Error when attempting to log chat message", err));
-    });
-
-    socket.on('pass', async (data) => {
-        const password = data[0];
-        if (password === config.adminPass) {
-            console.log('[ADMIN] ' + currentPlayer.name + ' just logged in as an admin.');
-            socket.emit('serverMSG', 'Welcome back ' + currentPlayer.name);
-            socket.broadcast.emit('serverMSG', currentPlayer.name + ' just logged in as an admin.');
-            currentPlayer.admin = true;
-        } else {
-            console.log('[ADMIN] ' + currentPlayer.name + ' attempted to log in with incorrect password.');
-
-            socket.emit('serverMSG', 'Password incorrect, attempt logged.');
-
-            loggingRepositry.logFailedLoginAttempt(currentPlayer.name, currentPlayer.ipAddress)
-                .catch((err) => console.error("Error when attempting to log failed login attempt", err));
-        }
-    });
-
-    socket.on('kick', (data) => {
-        if (!currentPlayer.admin) {
-            socket.emit('serverMSG', 'You are not permitted to use this command.');
-            return;
-        }
-
-        var reason = '';
-        var worked = false;
-        for (let playerIndex in map.players.data) {
-            let player = map.players.data[playerIndex];
-            if (player.name === data[0] && !player.admin && !worked) {
-                if (data.length > 1) {
-                    for (var f = 1; f < data.length; f++) {
-                        if (f === data.length) {
-                            reason = reason + data[f];
-                        }
-                        else {
-                            reason = reason + data[f] + ' ';
-                        }
-                    }
-                }
-                if (reason !== '') {
-                    console.log('[ADMIN] User ' + player.name + ' kicked successfully by ' + currentPlayer.name + ' for reason ' + reason);
-                }
-                else {
-                    console.log('[ADMIN] User ' + player.name + ' kicked successfully by ' + currentPlayer.name);
-                }
-                socket.emit('serverMSG', 'User ' + player.name + ' was kicked by ' + currentPlayer.name);
-                sockets[player.id].emit('kick', reason);
-                sockets[player.id].disconnect();
-                map.players.removePlayerByIndex(playerIndex);
-                worked = true;
-            }
-        }
-        if (!worked) {
-            socket.emit('serverMSG', 'Could not locate user or user is an admin.');
-        }
-    });
-
-    // Heartbeat function, update everytime.
-    socket.on('0', (target) => {
-        currentPlayer.lastHeartbeat = new Date().getTime();
-        if (target.x !== currentPlayer.x || target.y !== currentPlayer.y) {
-            currentPlayer.target = target;
-        }
-    });
-
-    socket.on('1', function () {
-        // Fire food.
-        for (let i = 0; i < currentPlayer.cells.length; i++) {
-            if (currentPlayer.cells[i].mass >= config.defaultPlayerMass + config.fireFood) {
-                currentPlayer.cells[i].mass -= config.fireFood;
-                currentPlayer.massTotal -= config.fireFood;
-                map.massFood.addNew(currentPlayer, i, config.fireFood);
-            }
-        }
-    });
-
-    socket.on('2', () => {
-        currentPlayer.userSplit(config.limitSplit, config.defaultPlayerMass);
-    });
-}
-
 const addSpectator = (socket) => {
     socket.on('gotit', function () {
-        sockets[socket.id] = socket;
+        netService.connectClient(socket.id, socket);
         spectators.push(socket.id);
-        io.emit('playerJoin', { name: '' });
+        netService.sendToAll('playerJoin', { name: 'Spectator' });
     });
 
     socket.emit("welcome", {}, {
@@ -208,67 +44,8 @@ const addSpectator = (socket) => {
     });
 }
 
-const tickPlayer = (currentPlayer) => {
-    if (currentPlayer.lastHeartbeat < new Date().getTime() - config.maxHeartbeatInterval) {
-        sockets[currentPlayer.id].emit('kick', 'Last heartbeat received over ' + config.maxHeartbeatInterval + ' ago.');
-        sockets[currentPlayer.id].disconnect();
-    }
-
-    currentPlayer.move(config.slowBase, config.gameWidth, config.gameHeight, INIT_MASS_LOG);
-
-    const isEntityInsideCircle = (point, circle) => {
-        return SAT.pointInCircle(new Vector(point.x, point.y), circle);
-    };
-
-    const canEatMass = (cell, cellCircle, cellIndex, mass) => {
-        if (isEntityInsideCircle(mass, cellCircle)) {
-            if (mass.id === currentPlayer.id && mass.speed > 0 && cellIndex === mass.num)
-                return false;
-            if (cell.mass > mass.mass * 1.1)
-                return true;
-        }
-
-        return false;
-    };
-
-    const canEatVirus = (cell, cellCircle, virus) => {
-        return virus.mass < cell.mass && isEntityInsideCircle(virus, cellCircle)
-    }
-
-    const cellsToSplit = [];
-    for (let cellIndex = 0; cellIndex < currentPlayer.cells.length; cellIndex++) {
-        const currentCell = currentPlayer.cells[cellIndex];
-
-        const playerCircle = new Circle(
-            new Vector(currentCell.x, currentCell.y),
-            currentCell.radius
-        );
-
-        const eatenFoodIndexes = util.getIndexes(map.food.data, food => isEntityInsideCircle(food, playerCircle));
-        const eatenMassIndexes = util.getIndexes(map.massFood.data, mass => canEatMass(currentCell, playerCircle, cellIndex, mass));
-        const eatenVirusIndexes = util.getIndexes(map.viruses.data, virus => canEatVirus(currentCell, playerCircle, virus));
-
-        if (eatenVirusIndexes.length > 0) {
-            cellsToSplit.push(cellIndex);
-            map.viruses.delete(eatenVirusIndexes)
-        }
-
-        let massGained = 0;
-        for (let index of eatenMassIndexes) { //eatenMassIndexes is an array of indexes -> "index of" instead of "index in" is intentional
-            massGained += map.massFood.data[index].mass;
-        }
-
-        map.food.delete(eatenFoodIndexes);
-        map.massFood.remove(eatenMassIndexes);
-        massGained += (eatenFoodIndexes.length * config.foodMass);
-        currentCell.addMass(massGained);
-        currentPlayer.massTotal += massGained;
-    }
-    currentPlayer.virusSplit(cellsToSplit, config.limitSplit, config.defaultPlayerMass);
-};
-
 const tickGame = () => {
-    map.players.data.forEach(tickPlayer);
+    map.players.data.forEach(player => playerService.tick(player));
     map.massFood.move(config.gameWidth, config.gameHeight);
 
     map.players.handleCollisions(function (gotEaten, eater) {
@@ -286,8 +63,8 @@ const tickGame = () => {
         let playerDied = map.players.removeCell(gotEaten.playerIndex, gotEaten.cellIndex);
         if (playerDied) {
             let playerGotEaten = map.players.data[gotEaten.playerIndex];
-            io.emit('playerDied', { name: playerGotEaten.name });
-            sockets[playerGotEaten.id].emit('RIP');
+            netService.sendToAll('playerDied', { name: playerGotEaten.name });
+            netService.sendToClient(playerGotEaten.id, 'RIP');
             map.players.removePlayerByIndex(gotEaten.playerIndex);
         }
     });
@@ -323,17 +100,17 @@ const gameloop = () => {
 const sendUpdates = () => {
     spectators.forEach(updateSpectator);
     map.enumerateWhatPlayersSee(function (playerData, visiblePlayers, visibleFood, visibleMass, visibleViruses) {
-        sockets[playerData.id].emit('serverTellPlayerMove', playerData, visiblePlayers, visibleFood, visibleMass, visibleViruses);
+        netService.sendToClient(playerData.id, 'serverTellPlayerMove', playerData, visiblePlayers, visibleFood, visibleMass, visibleViruses);
         if (leaderboardChanged) {
-            sendLeaderboard(sockets[playerData.id]);
+            sendLeaderboard(playerData.id);
         }
     });
 
     leaderboardChanged = false;
 };
 
-const sendLeaderboard = (socket) => {
-    socket.emit('leaderboard', {
+const sendLeaderboard = (clientId) => {
+    netService.sendToClient(clientId, 'leaderboard', {
         players: map.players.data.length,
         leaderboard
     });
@@ -348,17 +125,12 @@ const updateSpectator = (socketID) => {
         id: socketID,
         name: ''
     };
-    sockets[socketID].emit('serverTellPlayerMove', playerData, map.players.data, map.food.data, map.massFood.data, map.viruses.data);
+    netService.sendToClient(socketID, 'serverTellPlayerMove', playerData, map.players.data, map.food.data, map.massFood.data, map.viruses.data);
     if (leaderboardChanged) {
-        sendLeaderboard(sockets[socketID]);
+        sendLeaderboard(socketID);
     }
 }
 
 setInterval(tickGame, 1000 / 60);
 setInterval(gameloop, 1000);
 setInterval(sendUpdates, 1000 / config.networkUpdateFactor);
-
-// Don't touch, IP configurations.
-var ipaddress = process.env.OPENSHIFT_NODEJS_IP || process.env.IP || config.host;
-var serverport = process.env.OPENSHIFT_NODEJS_PORT || process.env.PORT || config.port;
-http.listen(serverport, ipaddress, () => console.log('[DEBUG] Listening on ' + ipaddress + ':' + serverport));
